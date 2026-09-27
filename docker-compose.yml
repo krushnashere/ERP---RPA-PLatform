@@ -1,0 +1,101 @@
+# ── Enterprise ERP & RPA Automation Platform — single-host stack ──────────────
+#
+#   docker compose up --build                 # postgres + api + worker + web
+#   docker compose exec api python -m app.seed
+#   docker compose up -d --scale worker=4     # scale the RPA queue
+#
+# Four services on purpose. The API and the worker are separate processes
+# sharing only the database — that separation IS the durable-queue design, so
+# collapsing them into one container would hide the thing worth demonstrating.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_dev_password}
+      POSTGRES_DB: erp_rpa
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U erp -d erp_rpa']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Published for local inspection only. In production remove this and let
+    # the API reach the DB over the compose network.
+    ports:
+      - '127.0.0.1:5432:5432'
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: production
+      DEBUG: 'false'
+      PORT: 8000
+      DATABASE_URL: postgresql+psycopg2://erp:${POSTGRES_PASSWORD:-erp_dev_password}@db:5432/erp_rpa
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY (openssl rand -hex 32)}
+      ACCESS_TOKEN_EXPIRE_MINUTES: '60'
+      REFRESH_TOKEN_EXPIRE_DAYS: '7'
+      # the web container proxies /api to this service, so the browser only
+      # ever talks to one origin
+      CORS_ORIGINS: http://localhost:8080,http://localhost:5173
+      UPLOAD_DIR: /app/uploads
+      BOOTSTRAP_ADMIN_EMAIL: admin@acme-erp.com
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-Admin@123}
+    volumes:
+      - uploads:/app/uploads
+    ports:
+      - '8000:8000'
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:8000/health']
+      interval: 30s
+      timeout: 5s
+      start-period: 20s
+      retries: 3
+
+  # Same image, different command. Scale this independently of the API:
+  #   docker compose up -d --scale worker=4
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+psycopg2://erp:${POSTGRES_PASSWORD:-erp_dev_password}@db:5432/erp_rpa
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY (openssl rand -hex 32)}
+      UPLOAD_DIR: /app/uploads
+      RPA_MAX_ATTEMPTS: '3'
+      RPA_BACKOFF_BASE_SECONDS: '2.0'
+      RPA_LEASE_SECONDS: '120'
+      RPA_POLL_INTERVAL_SECONDS: '1.0'
+      RPA_WORKER_CONCURRENCY: '2'
+    volumes:
+      - uploads:/app/uploads
+    command: ['python', '-m', 'app.worker']
+    # No healthcheck: a worker exposes no port. Liveness is `restart: always`
+    # plus the queue's own dead_letter / success_rate metrics.
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - '8080:80'
+
+volumes:
+  pgdata:
+  uploads:

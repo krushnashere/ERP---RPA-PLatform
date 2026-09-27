@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Two independent stacks in one repo: FastAPI backend + React frontend.
+# They are built and tested in parallel jobs so a frontend lint failure never
+# hides a backend test failure.
+jobs:
+  backend:
+    name: Backend (FastAPI + RPA worker)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check (catches syntax errors before the suite runs)
+        run: python -m compileall -q app
+
+      - name: Run tests
+        env:
+          # the suite builds its own throwaway SQLite DB; a fixed secret keeps
+          # token assertions deterministic
+          DATABASE_URL: sqlite:///./test_ci.db
+          JWT_SECRET_KEY: ci-only-secret-key-not-used-in-production-0000
+          ENVIRONMENT: test
+          DEBUG: "false"
+        run: pytest -v --tb=short
+
+      - name: Seed + boot smoke test
+        env:
+          DATABASE_URL: sqlite:///./smoke.db
+          JWT_SECRET_KEY: ci-only-secret-key-not-used-in-production-0000
+        run: |
+          python -m app.seed --reset
+          python - <<'PY'
+          # import the ASGI app and hit /health through the test client: proves
+          # the router wiring, DB session and settings all resolve at runtime
+          from fastapi.testclient import TestClient
+          from app.main import app
+          with TestClient(app) as client:
+              r = client.get("/health")
+              assert r.status_code == 200, r.text
+              print("health:", r.json())
+              r = client.post("/api/v1/auth/login", json={
+                  "email": "admin@acme-erp.com", "password": "Admin@123"})
+              assert r.status_code == 200, r.text
+              print("login ok, role:", r.json()["user"]["role"])
+          PY
+
+      - name: Drain the RPA queue once (worker end-to-end)
+        env:
+          DATABASE_URL: sqlite:///./smoke.db
+          JWT_SECRET_KEY: ci-only-secret-key-not-used-in-production-0000
+        run: python -m app.worker --once
+
+      - name: Build the Docker image
+        run: docker build -t erp-backend:ci .
+
+  frontend:
+    name: Frontend (React + Vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload the production bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: erp-frontend-dist
+          path: frontend/dist
+          retention-days: 7
